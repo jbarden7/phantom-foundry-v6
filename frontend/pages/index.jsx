@@ -1,14 +1,20 @@
-import Link from 'next/link';
 export default function Home(){
+  const demo = String(process.env.NEXT_PUBLIC_DEMO_MODE || 'true').toLowerCase() === 'true';
+  const api = process.env.NEXT_PUBLIC_API_BASE || '(not set)';
+
   return (
-    <div style={{fontFamily:'system-ui', padding:24, maxWidth:1000, margin:'0 auto'}}>
-      <h1>Phantom Foundry v6 — Dashboard (UK)</h1>
-      <p>Draft-only uploads by default. Use Settings to connect APIs.</p>
+    <main style={{maxWidth:960,margin:'0 auto',padding:24, fontFamily:'system-ui'}}>
+      <h1>Phantom Foundry — Dashboard</h1>
+      <p>
+        {demo ? 'Demo Mode is ON (safe, no real uploads).' : 'Live Mode. Draft-only is recommended.'}
+      </p>
+      <p>API Base: <code>{api}</code></p>
       <ul>
-        <li><Link href="/niche">Niche Finder</Link></li>
-        <li><Link href="/uploads">Uploads</Link></li>
-        <li><Link href="/settings">Settings</Link></li>
+        <li><a href="/niche">Niche Finder</a></li>
+        <li><a href="/uploads">Uploads</a></li>
+        <li><a href="/settings">Settings</a></li>
       </ul>
-    </div>
+      <p style={{opacity:.8}}>Tip: Set env vars in Vercel → Project → Settings → Environment Variables, then redeploy.</p>
+    </main>
   );
 }
