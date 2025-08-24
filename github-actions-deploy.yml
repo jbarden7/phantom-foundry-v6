@@ -1,0 +1,10 @@
+
+name: Deploy backend to Render (template)
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Note
+        run: echo 'This workflow is a template. See README for deploy steps and secrets.'

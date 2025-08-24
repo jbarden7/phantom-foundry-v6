@@ -1,0 +1,14 @@
+
+# Cloud Run deploy template for UK region (europe-west2)
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: phantom-foundry-api
+spec:
+  template:
+    spec:
+      containers:
+      - image: gcr.io/PROJECT/phantom-foundry-api
+        env:
+        - name: ENV
+          value: "prod"
