@@ -19,14 +19,12 @@ export default function Integrations(){
   const [msg, setMsg] = useState('');
 
   async function refresh(){
-    // /health
     try{
       const r = await fetch(`${api}/health`);
       const j = await r.json().catch(()=>({}));
       setHealth({ok:r.ok, msg: j.status || r.statusText});
     }catch(e){ setHealth({ok:false, msg:String(e)}); }
 
-    // /integrations/status
     try{
       const r = await fetch(`${api}/integrations/status`);
       if(!r.ok){
@@ -49,7 +47,7 @@ export default function Integrations(){
     try{
       const r = await fetch(`${api}/etsy/try-login`, { method:'POST' });
       const j = await r.json().catch(()=>({}));
-      if(r.status === 428 || j?.detail === '2FA required' || j?.twofa_required){ // 428 Precondition Required
+      if(r.status === 428 || j?.detail === '2FA required' || j?.twofa_required){
         const code = prompt('Enter your Etsy 2FA code:');
         if(!code){ setMsg('2FA cancelled'); setBusy(false); return; }
         setMsg('Submitting 2FA…');
@@ -73,7 +71,7 @@ export default function Integrations(){
       setMsg('Error: ' + String(e));
     } finally {
       setBusy(false);
-      await refresh(); // update the green/red tiles
+      await refresh();
     }
   }
 
