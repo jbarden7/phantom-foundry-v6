@@ -6,7 +6,8 @@ from compliance import run_compliance_checks
 from prompts import generate_prompts
 from etsy_worker import queue_draft
 
-from routes.etsy_login import router as etsy_login_router  
+from routes.etsy_login import router as etsy_login_router
+from routes.integrations import router as integrations_router
 
 app = FastAPI()
 app.add_middleware(
@@ -17,6 +18,7 @@ app.add_middleware(
 )
 
 app.include_router(etsy_login_router)
+app.include_router(integrations_router)
 
 @app.get('/health')
 def health():
