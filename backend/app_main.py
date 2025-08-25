@@ -2,14 +2,12 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import csv, io
 
-# ⬇️ use absolute package paths
 from backend.compliance import run_compliance_checks
 from backend.prompts import generate_prompts
 from backend.etsy_worker import queue_draft
 
 from backend.routes.etsy_login import router as etsy_login_router
 from backend.routes.integrations import router as integrations_router
-
 
 app = FastAPI()
 app.add_middleware(
