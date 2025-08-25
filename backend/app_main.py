@@ -5,7 +5,6 @@ import csv, io
 from backend.compliance import run_compliance_checks
 from backend.prompts import generate_prompts
 from backend.etsy_worker import queue_draft
-
 from routes.etsy_login import router as etsy_login_router
 from routes.integrations import router as integrations_router
 
