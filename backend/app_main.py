@@ -2,14 +2,16 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import csv, io
 
-from backend.compliance import run_compliance_checks
-from backend.prompts import generate_prompts
-from backend.etsy_worker import queue_draft
+# Use package-relative imports so they work in Docker/Render
+from .compliance import run_compliance_checks
+from .prompts import generate_prompts
+from .etsy_worker import queue_draft
 
-from backend.routes.etsy_login import router as etsy_login_router
-from backend.routes.integrations import router as integrations_router
+from .routes.etsy_login import router as etsy_login_router
+from .routes.integrations import router as integrations_router
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=['*'],
@@ -17,6 +19,7 @@ app.add_middleware(
     allow_headers=['*']
 )
 
+# Routers
 app.include_router(etsy_login_router)
 app.include_router(integrations_router)
 
@@ -26,28 +29,33 @@ def health():
 
 @app.post('/niche/find')
 def niche_find(body: dict):
+    niche = (body or {}).get('niche') or 'Funny Cat Dad Mugs'
+    # Placeholder – your real niche finder likely calls the backend service you deployed
     return {
         'results': [
-            {'name': 'Funny Cat Dad Mugs', 'demand': 82, 'competition': 35, 'profit': 48}
+            {'name': niche, 'demand': 82, 'competition': 35, 'profit': 48}
         ]
     }
 
 @app.post('/design/prompts')
 def design_prompts(body: dict):
-    return {'prompts': generate_prompts(body.get('niche'))}
+    return {'prompts': generate_prompts((body or {}).get('niche', 'cats'))}
 
 @app.post('/etsy/drafts')
 async def etsy_drafts(file: UploadFile = File(...)):
+    """
+    Receives a CSV of draft listings, runs compliance checks, and queues drafts.
+    Draft-only by design. The actual Etsy automation can be expanded in etsy_worker.py.
+    """
     text = (await file.read()).decode('utf-8', 'ignore')
     rows = list(csv.DictReader(io.StringIO(text)))
     results = run_compliance_checks(rows)
     logs = []
     for i, r in enumerate(rows):
+        title = r.get("title") or f"Item #{i+1}"
         if results[i]['ok']:
-            queue_draft(r)
-            logs.append(f'Queued draft for {r.get("title")}')
+            queue_draft(r)  # stubbed queue
+            logs.append(f'Queued draft for {title}')
         else:
-            logs.append(
-                f'Compliance fail for {r.get("title")} -> {results[i]["reasons"]}'
-            )
+            logs.append(f'Compliance fail for {title} -> {", ".join(results[i]["reasons"])}')
     return {'logs': logs}
