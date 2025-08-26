@@ -1,12 +1,11 @@
-from fastapi import FastAPI, UploadFile, File
+# backend/app_main.py
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import csv, io, os, sys, importlib.util
+from typing import Optional
 
+# ---------- Utility: safe fallback import from file ----------
 def _fallback_import(module_name: str, file_path: str):
-    """
-    Safe loader that imports a module from a specific file path if the normal
-    package import isn't available. Returns the loaded module.
-    """
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec and spec.loader:
         mod = importlib.util.module_from_spec(spec)
@@ -15,9 +14,7 @@ def _fallback_import(module_name: str, file_path: str):
         return mod
     raise ModuleNotFoundError(f"Could not load module {module_name} from {file_path}")
 
-# --- Import local modules (package style first, then file fallback) ---
-
-# compliance / prompts / worker
+# ---------- Try normal imports first; fallback to file paths ----------
 try:
     from compliance import run_compliance_checks
 except ModuleNotFoundError:
@@ -39,34 +36,140 @@ except ModuleNotFoundError:
         "etsy_worker", os.path.join(os.path.dirname(__file__), "etsy_worker.py")
     ).queue_draft
 
-# routers
-try:
-    from routes.etsy_login import router as etsy_login_router
-except ModuleNotFoundError:
-    etsy_login_router = _fallback_import(
-        "routes.etsy_login", os.path.join(os.path.dirname(__file__), "routes", "etsy_login.py")
-    ).router
+# ---------- Inlined Etsy Login (no import from routes) ----------
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-try:
-    from routes.integrations import router as integrations_router
-except ModuleNotFoundError:
-    integrations_router = _fallback_import(
-        "routes.integrations", os.path.join(os.path.dirname(__file__), "routes", "integrations.py")
-    ).router
+_ETSY_STORAGE_STATE: Optional[dict] = None  # session persists while container lives
 
-# --- FastAPI app ---
+def _need_env(name: str) -> str:
+    v = os.getenv(name, "")
+    if not v:
+        raise HTTPException(status_code=400, detail=f"Missing env var: {name}")
+    return v
 
+async def _etsy_login_with_email_password(email: str, password: str, otp_code: Optional[str] = None):
+    ua = os.getenv("ETSY_USER_AGENT", "")
+    launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(**launch_args)
+        context_kwargs = {}
+        if ua:
+            context_kwargs["user_agent"] = ua
+        context_kwargs.update({"locale": "en-GB", "timezone_id": "Europe/London"})
+        context = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+        try:
+            await page.goto("https://www.etsy.com/signin", timeout=60000)
+
+            # Accept cookie banner if present (best effort)
+            for sel in ["button:has-text('Accept all')", "button:has-text('Accept')",
+                        "[data-gdpr-single-accept]", "#gdpr-single-accept"]:
+                try:
+                    if await page.locator(sel).first.is_visible(timeout=1500):
+                        await page.locator(sel).first.click()
+                        break
+                except Exception:
+                    pass
+
+            # Email
+            await page.fill("input[name='email'], #join_neu_email_field", email)
+            await page.locator("button:has-text('Continue'), button[type='submit']").first.click()
+
+            # Password
+            await page.wait_for_selector("input[name='password'], #join_neu_password_field", timeout=30000)
+            await page.fill("input[name='password'], #join_neu_password_field", password)
+            await page.locator("button:has-text('Sign in'), button[type='submit']").first.click()
+
+            # Detect logged in or 2FA
+            logged_in = page.locator("[data-id='your-account-panel-toggle'], a[href*='your/account']")
+            otp_input = page.locator("input[type='text'][name*='code'], input[name='code'], input[id*='code']")
+
+            await page.wait_for_timeout(1200)
+            if await logged_in.count() > 0:
+                state = await context.storage_state()
+                await browser.close()
+                return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in"}
+
+            twofa = False
+            try:
+                twofa = await otp_input.first.is_visible(timeout=4000)
+            except Exception:
+                twofa = False
+
+            if twofa:
+                if not otp_code:
+                    await browser.close()
+                    return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA required"}
+                await otp_input.first.fill(otp_code)
+                for sel in ["button:has-text('Confirm')", "button:has-text('Verify')", "button[type='submit']"]:
+                    try:
+                        if await page.locator(sel).first.is_visible(timeout=1500):
+                            await page.locator(sel).first.click()
+                            break
+                    except Exception:
+                        pass
+                try:
+                    await logged_in.first.wait_for(timeout=30000)
+                    state = await context.storage_state()
+                    await browser.close()
+                    return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in with 2FA"}
+                except PWTimeout:
+                    await browser.close()
+                    return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA failed/timed out"}
+
+            await browser.close()
+            return {"ok": False, "twofa_required": False, "storage_state": None, "message": "Login failed"}
+        except Exception as e:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            return {"ok": False, "twofa_required": False, "storage_state": None, "message": f"Error: {e}"}
+
+# ---------- FastAPI app ----------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=['*'],  # you can tighten to your Vercel URL later
     allow_methods=['*'],
     allow_headers=['*'],
 )
 
-app.include_router(etsy_login_router)
-app.include_router(integrations_router)
+# Etsy login endpoints (UI can call these)
+@app.post("/etsy/try-login")
+async def etsy_try_login(payload: dict = Body(default={})):
+    email = _need_env("ETSY_EMAIL")
+    password = _need_env("ETSY_PASSWORD")
+    otp_code = (payload or {}).get("otp_code")
+    result = await _etsy_login_with_email_password(email, password, otp_code=otp_code)
+    global _ETSY_STORAGE_STATE
+    if result.get("ok") and result.get("storage_state"):
+        _ETSY_STORAGE_STATE = result["storage_state"]
+    if result.get("twofa_required") and not result.get("ok"):
+        raise HTTPException(status_code=428, detail="2FA required")
+    return result
+
+@app.get("/etsy/session-status")
+async def etsy_session_status():
+    ok = _ETSY_STORAGE_STATE is not None
+    return {"service": "Etsy", "ok": ok, "message": "Session cached" if ok else "Not logged in"}
+
+# Integrations tile for the frontend
+@app.get("/integrations/status")
+async def integrations_status():
+    items = []
+    items.append({
+        "label": "OpenAI",
+        "ok": bool(os.getenv("OPENAI_API_KEY")),
+        "message": "API key present" if os.getenv("OPENAI_API_KEY") else "Missing OPENAI_API_KEY"
+    })
+    items.append({
+        "label": "Etsy",
+        "ok": _ETSY_STORAGE_STATE is not None,
+        "message": "Session cached" if _ETSY_STORAGE_STATE else "Not logged in"
+    })
+    return items
 
 @app.get("/health")
 def health():
@@ -90,9 +193,9 @@ async def etsy_drafts(file: UploadFile = File(...)):
     for i, r in enumerate(rows):
         title = r.get("title") or f"Item #{i+1}"
         if results[i]["ok"]:
-            queue_draft(r)
+            queue_draft(r)  # stubbed; implement real Playwright worker later
             logs.append(f"Queued draft for {title}")
         else:
             reasons = results[i].get("reasons") or []
             logs.append(f"Compliance fail for {title} -> {', '.join(reasons) if reasons else 'unknown reason'}")
-    return {"logs": logs} 
+    return {"logs": logs}
