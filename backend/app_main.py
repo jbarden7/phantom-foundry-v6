@@ -1,8 +1,9 @@
-# backend/app_main.py
+# === BEGIN backend/app_main.py ===
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import csv, io, os, sys, importlib.util
 from typing import Optional
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ---------- Utility: safe fallback import from file ----------
 def _fallback_import(module_name: str, file_path: str):
@@ -36,9 +37,7 @@ except ModuleNotFoundError:
         "etsy_worker", os.path.join(os.path.dirname(__file__), "etsy_worker.py")
     ).queue_draft
 
-# ---------- Inlined Etsy Login (no import from routes) ----------
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-
+# ---------- Global session store ----------
 _ETSY_STORAGE_STATE: Optional[dict] = None  # session persists while container lives
 
 def _need_env(name: str) -> str:
@@ -47,238 +46,166 @@ def _need_env(name: str) -> str:
         raise HTTPException(status_code=400, detail=f"Missing env var: {name}")
     return v
 
+# ---------- Etsy login via Playwright ----------
 async def _etsy_login_with_email_password(email: str, password: str, otp_code: Optional[str] = None):
     ua = os.getenv("ETSY_USER_AGENT", "")
-    login_url = os.getenv("ETSY_LOGIN_URL", "https://www.etsy.com/signin")
     launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_args)
-        context_kwargs = {"locale": "en-GB", "timezone_id": "Europe/London"}
+        context_kwargs = {}
         if ua:
             context_kwargs["user_agent"] = ua
+        context_kwargs.update({"locale": "en-GB", "timezone_id": "Europe/London"})
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
-
-        # Enable tracing & screenshots to debug if something goes wrong
         try:
-            await context.tracing.start(screenshots=True, snapshots=True, sources=False)
-        except Exception:
-            pass
+            await page.goto("https://www.etsy.com/signin", timeout=60000)
 
-        async def debug_dump(prefix="etsy"):
-            # Saves a quick screenshot + HTML for debugging
-            try:
-                await page.screenshot(path=f"/tmp/{prefix}.png", full_page=True)
-                html = await page.content()
-                with open(f"/tmp/{prefix}.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-            except Exception:
-                pass
-
-        try:
-            # Go to login and wait until network is mostly quiet
-            await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-
-            # Kill any cookie banners that might block inputs
-            cookie_selectors = [
+            # Accept cookie banner if present (best effort)
+            for sel in [
                 "button:has-text('Accept all')",
                 "button:has-text('Accept')",
                 "[data-gdpr-single-accept]",
-                "#gdpr-single-accept",
-                "button[aria-label*='Accept']",
-            ]
-            for sel in cookie_selectors:
+                "#gdpr-single-accept"
+            ]:
                 try:
-                    loc = page.locator(sel).first
-                    if await loc.is_visible(timeout=1000):
-                        await loc.click()
+                    if await page.locator(sel).first.is_visible(timeout=1500):
+                        await page.locator(sel).first.click()
                         break
                 except Exception:
                     pass
 
-            # Robust locators for Email
-            email_locators = [
-                page.get_by_label("Email", exact=False),
-                page.get_by_role("textbox", name=lambda n: n and "email" in n.lower()),
-                page.locator("input[type='email']"),
-                page.locator("input[name='email']"),
-                page.locator("#join_neu_email_field"),
-            ]
+            # Email
+            await page.wait_for_selector("input[name='email'], #join_neu_email_field", timeout=30000)
+            await page.fill("input[name='email'], #join_neu_email_field", email)
+            await page.locator("button:has-text('Continue'), button[type='submit']").first.click()
 
-            # Robust locators for Continue/Submit
-            continue_buttons = [
-                page.get_by_role("button", name=lambda n: n and ("continue" in n.lower() or "next" in n.lower())),
-                page.locator("button[type='submit']"),
-                page.locator("button:has-text('Continue')"),
-                page.locator("button:has-text('Sign in')"),
-            ]
+            # Password
+            await page.wait_for_selector("input[name='password'], #join_neu_password_field", timeout=30000)
+            await page.fill("input[name='password'], #join_neu_password_field", password)
+            await page.locator("button:has-text('Sign in'), button[type='submit']").first.click()
 
-            # Fill email
-            filled_email = False
-            for loc in email_locators:
-                try:
-                    await loc.wait_for(timeout=8000)
-                    await loc.fill(email, timeout=8000)
-                    filled_email = True
-                    break
-                except Exception:
-                    continue
-            if not filled_email:
-                await debug_dump("etsy_email_fail")
-                await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                await browser.close()
-                return {"ok": False, "twofa_required": False, "storage_state": None,
-                        "message": "Email field not found (saved /tmp/etsy_email_fail.png/.html)"}
-
-            # Click continue/submit for email step
-            clicked = False
-            for btn in continue_buttons:
-                try:
-                    if await btn.is_visible(timeout=2000):
-                        await btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                # Not all flows need a 'continue'; proceed
-                pass
-
-            # Wait a moment for password field to appear
-            try:
-                await page.wait_for_timeout(1200)
-            except Exception:
-                pass
-
-            # Robust locators for Password
-            password_locators = [
-                page.get_by_label("Password", exact=False),
-                page.locator("input[type='password']"),
-                page.locator("#join_neu_password_field"),
-                page.locator("input[name='password']"),
-            ]
-
-            filled_pass = False
-            for loc in password_locators:
-                try:
-                    await loc.wait_for(timeout=8000)
-                    await loc.fill(password, timeout=8000)
-                    filled_pass = True
-                    break
-                except Exception:
-                    continue
-            if not filled_pass:
-                await debug_dump("etsy_password_fail")
-                await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                await browser.close()
-                return {"ok": False, "twofa_required": False, "storage_state": None,
-                        "message": "Password field not found (saved /tmp/etsy_password_fail.png/.html)"}
-
-            # Click Sign in / Submit
-            signin_buttons = [
-                page.get_by_role("button", name=lambda n: n and ("sign in" in n.lower() or "log in" in n.lower())),
-                page.locator("button[type='submit']"),
-                page.locator("button:has-text('Sign in')"),
-                page.locator("button:has-text('Log in')"),
-            ]
-            for btn in signin_buttons:
-                try:
-                    if await btn.is_visible(timeout=2000):
-                        await btn.click()
-                        break
-                except Exception:
-                    continue
-
-            # Check for logged-in signal or 2FA
+            # Detect logged in or 2FA
             logged_in = page.locator("[data-id='your-account-panel-toggle'], a[href*='your/account']")
             otp_input = page.locator("input[type='text'][name*='code'], input[name='code'], input[id*='code']")
 
-            try:
-                await logged_in.first.wait_for(timeout=5000)
+            await page.wait_for_timeout(1200)
+            if await logged_in.count() > 0:
                 state = await context.storage_state()
-                try:
-                    await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                except Exception:
-                    pass
                 await browser.close()
                 return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in"}
-            except Exception:
-                pass
 
-            # 2FA flow
-            requires_2fa = False
+            twofa = False
             try:
-                requires_2fa = await otp_input.first.is_visible(timeout=4000)
+                twofa = await otp_input.first.is_visible(timeout=4000)
             except Exception:
-                requires_2fa = False
+                twofa = False
 
-            if requires_2fa:
+            if twofa:
                 if not otp_code:
-                    # Pause here so UI can request the OTP
-                    try:
-                        await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                    except Exception:
-                        pass
                     await browser.close()
                     return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA required"}
-
                 await otp_input.first.fill(otp_code)
-                verify_buttons = [
-                    page.get_by_role("button", name=lambda n: n and ("verify" in n.lower() or "confirm" in n.lower())),
-                    page.locator("button:has-text('Confirm')"),
-                    page.locator("button:has-text('Verify')"),
-                    page.locator("button[type='submit']"),
-                ]
-                for btn in verify_buttons:
+                for sel in ["button:has-text('Confirm')", "button:has-text('Verify')", "button[type='submit']"]:
                     try:
-                        if await btn.is_visible(timeout=1500):
-                            await btn.click()
+                        if await page.locator(sel).first.is_visible(timeout=1500):
+                            await page.locator(sel).first.click()
                             break
                     except Exception:
-                        continue
-
-                try:
-                    await logged_in.first.wait_for(timeout=20000)
-                    state = await context.storage_state()
-                    try:
-                        await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                    except Exception:
                         pass
+                try:
+                    await logged_in.first.wait_for(timeout=30000)
+                    state = await context.storage_state()
                     await browser.close()
                     return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in with 2FA"}
-                except Exception:
-                    await debug_dump("etsy_2fa_fail")
-                    try:
-                        await context.tracing.stop(path="/tmp/etsy-trace.zip")
-                    except Exception:
-                        pass
+                except PWTimeout:
                     await browser.close()
-                    return {"ok": False, "twofa_required": True, "storage_state": None,
-                            "message": "2FA failed/timed out (saved /tmp/etsy_2fa_fail.png/.html)"}
+                    return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA failed/timed out"}
 
-            # Neither logged in nor 2FA appeared
-            await debug_dump("etsy_login_unknown")
-            try:
-                await context.tracing.stop(path="/tmp/etsy-trace.zip")
-            except Exception:
-                pass
             await browser.close()
-            return {"ok": False, "twofa_required": False, "storage_state": None,
-                    "message": "Login flow did not reach expected state (saved /tmp/etsy_login_unknown.png/.html)"}
-
+            return {"ok": False, "twofa_required": False, "storage_state": None, "message": "Login failed"}
         except Exception as e:
-            await debug_dump("etsy_login_error")
-            try:
-                await context.tracing.stop(path="/tmp/etsy-trace.zip")
-            except Exception:
-                pass
             try:
                 await browser.close()
             except Exception:
                 pass
-            return {"ok": False, "twofa_required": False, "storage_state": None, "message": f"Error: {e}"} 
+            return {"ok": False, "twofa_required": False, "storage_state": None, "message": f"Error: {e}"}
+
+# ---------- FastAPI app ----------
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://phantom-foundry-frontend.vercel.app",  # your Vercel frontend
+        "https://phantom-foundry.onrender.com"          # your Render backend
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# Etsy login endpoints (UI can call these)
+@app.post("/etsy/try-login")
+async def etsy_try_login(payload: dict = Body(default={})):
+    email = _need_env("ETSY_EMAIL")
+    password = _need_env("ETSY_PASSWORD")
+    otp_code = (payload or {}).get("otp_code")
+    result = await _etsy_login_with_email_password(email, password, otp_code=otp_code)
+    global _ETSY_STORAGE_STATE
+    if result.get("ok") and result.get("storage_state"):
+        _ETSY_STORAGE_STATE = result["storage_state"]
+    if result.get("twofa_required") and not result.get("ok"):
+        raise HTTPException(status_code=428, detail="2FA required")
+    return result
+
+@app.get("/etsy/session-status")
+async def etsy_session_status():
+    ok = _ETSY_STORAGE_STATE is not None
+    return {"service": "Etsy", "ok": ok, "message": "Session cached" if ok else "Not logged in"}
+
+# Integrations tile for the frontend
+@app.get("/integrations/status")
+async def integrations_status():
+    items = []
+    items.append({
+        "label": "OpenAI",
+        "ok": bool(os.getenv("OPENAI_API_KEY")),
+        "message": "API key present" if os.getenv("OPENAI_API_KEY") else "Missing OPENAI_API_KEY"
+    })
+    items.append({
+        "label": "Etsy",
+        "ok": _ETSY_STORAGE_STATE is not None,
+        "message": "Session cached" if _ETSY_STORAGE_STATE else "Not logged in"
+    })
+    return items
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/niche/find")
+def niche_find(body: dict):
+    niche = (body or {}).get("niche") or "Funny Cat Dad Mugs"
+    return {"results": [{"name": niche, "demand": 82, "competition": 35, "profit": 48}]}
+
+@app.post("/design/prompts")
+def design_prompts(body: dict):
+    return {"prompts": generate_prompts((body or {}).get("niche", "cats"))}
+
+@app.post("/etsy/drafts")
+async def etsy_drafts(file: UploadFile = File(...)):
+    text = (await file.read()).decode("utf-8", "ignore")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    results = run_compliance_checks(rows)
+    logs = []
+    for i, r in enumerate(rows):
+        title = r.get("title") or f"Item #{i+1}"
+        if results[i]["ok"]:
+            queue_draft(r)  # stubbed; implement real Playwright worker later
+            logs.append(f"Queued draft for {title}")
+        else:
+            reasons = results[i].get("reasons") or []
+            logs.append(f"Compliance fail for {title} -> {', '.join(reasons) if reasons else 'unknown reason'}")
+    return {"logs": logs}
+# === END backend/app_main.py ===
