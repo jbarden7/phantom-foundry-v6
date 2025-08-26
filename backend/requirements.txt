@@ -3,4 +3,4 @@ uvicorn[standard]
 python-multipart
 requests
 python-dotenv
-playwright
+playwright==1.47.0
