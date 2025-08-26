@@ -131,6 +131,9 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=['*'],  # you can tighten to your Vercel URL later
+    allow_methods=['*'],
+    allow_headers=['*'],
     allow_origins=[
         "https://phantom-foundry-frontend.vercel.app",
         "https://phantom-foundry.onrender.com"
