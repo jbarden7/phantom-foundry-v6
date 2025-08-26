@@ -1,7 +1,6 @@
-# routes/integrations.py
 import os
 from fastapi import APIRouter
-from routes.etsy_login import _ETSY_STORAGE_STATE  # make sure routes/etsy_login.py exists as we added earlier
+from .etsy_login import _ETSY_STORAGE_STATE
 
 router = APIRouter()
 
