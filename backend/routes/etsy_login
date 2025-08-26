@@ -1,102 +1,88 @@
-# routes/etsy_login.py
-import os, json, asyncio
+import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Body
-from starlette import status
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 router = APIRouter()
 
-# In-process cache of a valid session (resets when Render restarts)
+# In-memory storage of a logged-in session (persists until container restarts)
 _ETSY_STORAGE_STATE: Optional[dict] = None
 
-def _get_env(name: str) -> str:
+def _need(name: str) -> str:
     v = os.getenv(name, "")
     if not v:
         raise HTTPException(status_code=400, detail=f"Missing env var: {name}")
     return v
 
-async def _etsy_login(email: str, password: str, otp_code: Optional[str] = None):
-    """Returns dict like: {ok: bool, twofa_required: bool, storage_state: dict|None, message: str}"""
-    user_agent = os.getenv("ETSY_USER_AGENT", "")
+async def _login_with_email_password(email: str, password: str, otp_code: Optional[str] = None):
+    """
+    Logs into Etsy using credentials stored in env vars.
+    If 2FA required and no otp_code provided -> return twofa_required.
+    Returns dict: {ok: bool, twofa_required: bool, storage_state: dict|None, message: str}
+    """
+    ua = os.getenv("ETSY_USER_AGENT", "")
     launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
     async with async_playwright() as p:
         browser = await p.chromium.launch(**launch_args)
         context_kwargs = {}
-        if user_agent:
-            context_kwargs["user_agent"] = user_agent
+        if ua:
+            context_kwargs["user_agent"] = ua
+        # Helpful hints for consistency:
+        context_kwargs.update({"locale": "en-GB", "timezone_id": "Europe/London"})
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
-
         try:
-            # Go to sign in page directly
             await page.goto("https://www.etsy.com/signin", timeout=60000)
 
-            # Try to accept cookie banners if present (best-effort)
-            for sel in [
-                "button:has-text('Accept all')",
-                "button:has-text('Accept')",
-                "[data-gdpr-single-accept]",
-                "#gdpr-single-accept",
-            ]:
+            # Accept cookie banner if present (best effort)
+            for sel in ["button:has-text('Accept all')", "button:has-text('Accept')", "[data-gdpr-single-accept]", "#gdpr-single-accept"]:
                 try:
-                    if await page.locator(sel).first.is_visible(timeout=2000):
+                    if await page.locator(sel).first.is_visible(timeout=1500):
                         await page.locator(sel).first.click()
                         break
                 except Exception:
                     pass
 
-            # Email step (Etsy sometimes uses #join_neu_email_field)
-            email_selector = "input[name='email'], #join_neu_email_field"
-            await page.fill(email_selector, email, timeout=30000)
-            # Continue / submit
+            # Email
+            await page.fill("input[name='email'], #join_neu_email_field", email)
             await page.locator("button:has-text('Continue'), button[type='submit']").first.click()
 
-            # Password step
-            pw_selector = "input[name='password'], #join_neu_password_field"
-            await page.wait_for_selector(pw_selector, timeout=30000)
-            await page.fill(pw_selector, password)
+            # Password
+            await page.wait_for_selector("input[name='password'], #join_neu_password_field", timeout=30000)
+            await page.fill("input[name='password'], #join_neu_password_field", password)
             await page.locator("button:has-text('Sign in'), button[type='submit']").first.click()
 
-            # Check if logged in or asked for 2FA
-            # Heuristics for "logged in": account menu exists
-            logged_in_locator = page.locator("[data-id='your-account-panel-toggle'], a[href*='your/account']")
-            otp_input_locator = page.locator("input[type='text'][name*='code'], input[name='code'], input[id*='code']")
+            # Detect logged in or 2FA
+            logged_in = page.locator("[data-id='your-account-panel-toggle'], a[href*='your/account']")
+            otp_input = page.locator("input[type='text'][name*='code'], input[name='code'], input[id*='code']")
 
+            # quick wait
+            await page.wait_for_timeout(1200)
+            if await logged_in.count() > 0:
+                state = await context.storage_state()
+                await browser.close()
+                return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in"}
+
+            twofa = False
             try:
-                await page.wait_for_timeout(1500)
-                if await logged_in_locator.count() > 0:
-                    # Success
-                    state = await context.storage_state()
-                    await browser.close()
-                    return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in"}
+                twofa = await otp_input.first.is_visible(timeout=4000)
             except Exception:
-                pass
+                twofa = False
 
-            # 2FA?
-            twofa_visible = False
-            try:
-                twofa_visible = await otp_input_locator.first.is_visible(timeout=5000)
-            except Exception:
-                twofa_visible = False
-
-            if twofa_visible:
+            if twofa:
                 if not otp_code:
                     await browser.close()
                     return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA required"}
-                # Submit OTP
-                await otp_input_locator.first.fill(otp_code)
-                # Confirm/submit OTP (multiple possible labels)
+                await otp_input.first.fill(otp_code)
                 for sel in ["button:has-text('Confirm')", "button:has-text('Verify')", "button[type='submit']"]:
                     try:
-                        if await page.locator(sel).first.is_visible(timeout=2000):
+                        if await page.locator(sel).first.is_visible(timeout=1500):
                             await page.locator(sel).first.click()
                             break
                     except Exception:
                         pass
-                # Wait for login success
                 try:
-                    await logged_in_locator.first.wait_for(timeout=30000)
+                    await logged_in.first.wait_for(timeout=30000)
                     state = await context.storage_state()
                     await browser.close()
                     return {"ok": True, "twofa_required": False, "storage_state": state, "message": "Logged in with 2FA"}
@@ -104,10 +90,8 @@ async def _etsy_login(email: str, password: str, otp_code: Optional[str] = None)
                     await browser.close()
                     return {"ok": False, "twofa_required": True, "storage_state": None, "message": "2FA failed or timed out"}
 
-            # If we get here, login likely failed
             await browser.close()
             return {"ok": False, "twofa_required": False, "storage_state": None, "message": "Login failed"}
-
         except Exception as e:
             try:
                 await browser.close()
@@ -117,30 +101,34 @@ async def _etsy_login(email: str, password: str, otp_code: Optional[str] = None)
 
 @router.post("/etsy/try-login")
 async def etsy_try_login(payload: dict = Body(default={})):
-    """One endpoint: call once (no otp) → if 2FA needed, you'll get twofa_required=true.
-       Call again with {"otp_code":"123456"} to complete it."""
-    email = _get_env("ETSY_EMAIL")
-    password = _get_env("ETSY_PASSWORD")
+    """
+    First call without body → if 2FA needed returns HTTP 428.
+    Second call with {"otp_code":"123456"} completes login.
+    """
+    email = _need("ETSY_EMAIL")
+    password = _need("ETSY_PASSWORD")
     otp_code = (payload or {}).get("otp_code")
-    result = await _etsy_login(email, password, otp_code=otp_code)
+
+    result = await _login_with_email_password(email, password, otp_code=otp_code)
     global _ETSY_STORAGE_STATE
     if result.get("ok") and result.get("storage_state"):
-        _ETSY_STORAGE_STATE = result["storage_state"]  # cache in-memory
-    # Use 428 Precondition Required for 2FA
+        _ETSY_STORAGE_STATE = result["storage_state"]
+
     if result.get("twofa_required") and not result.get("ok"):
+        # 428 Precondition Required → your frontend already handles this case
         raise HTTPException(status_code=428, detail="2FA required")
+
     return result
 
 @router.get("/etsy/session-status")
 async def etsy_session_status():
-    """Simple status for the Integrations page."""
     ok = _ETSY_STORAGE_STATE is not None
     return {"service": "Etsy", "ok": ok, "message": "Session cached" if ok else "Not logged in"}
 
-# Expose a factory for other routes to use a logged-in context
+# Util for other modules
 async def get_logged_in_context():
     if not _ETSY_STORAGE_STATE:
-        raise HTTPException(status_code=401, detail="Etsy not logged in. Call /etsy/try-login first.")
+        raise HTTPException(status_code=401, detail="Etsy not logged in. Use /etsy/try-login first.")
     p = await async_playwright().start()
     browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
     context = await browser.new_context(storage_state=_ETSY_STORAGE_STATE)
