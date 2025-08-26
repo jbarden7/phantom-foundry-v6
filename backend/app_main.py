@@ -131,9 +131,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],  # you can tighten to your Vercel URL later
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_origins=[
+        "https://phantom-foundry-frontend.vercel.app",
+        "https://phantom-foundry.onrender.com"
+],
+allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 # Etsy login endpoints (UI can call these)
