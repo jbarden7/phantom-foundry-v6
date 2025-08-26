@@ -1,9 +1,8 @@
-# === BEGIN backend/app_main.py ===
+# backend/app_main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import csv, io, os, sys, importlib.util
 from typing import Optional
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ---------- Utility: safe fallback import from file ----------
 def _fallback_import(module_name: str, file_path: str):
@@ -37,7 +36,9 @@ except ModuleNotFoundError:
         "etsy_worker", os.path.join(os.path.dirname(__file__), "etsy_worker.py")
     ).queue_draft
 
-# ---------- Global session store ----------
+# ---------- Inlined Etsy Login (no import from routes) ----------
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
 _ETSY_STORAGE_STATE: Optional[dict] = None  # session persists while container lives
 
 def _need_env(name: str) -> str:
@@ -46,7 +47,6 @@ def _need_env(name: str) -> str:
         raise HTTPException(status_code=400, detail=f"Missing env var: {name}")
     return v
 
-# ---------- Etsy login via Playwright ----------
 async def _etsy_login_with_email_password(email: str, password: str, otp_code: Optional[str] = None):
     ua = os.getenv("ETSY_USER_AGENT", "")
     launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
@@ -62,12 +62,8 @@ async def _etsy_login_with_email_password(email: str, password: str, otp_code: O
             await page.goto("https://www.etsy.com/signin", timeout=60000)
 
             # Accept cookie banner if present (best effort)
-            for sel in [
-                "button:has-text('Accept all')",
-                "button:has-text('Accept')",
-                "[data-gdpr-single-accept]",
-                "#gdpr-single-accept"
-            ]:
+            for sel in ["button:has-text('Accept all')", "button:has-text('Accept')",
+                        "[data-gdpr-single-accept]", "#gdpr-single-accept"]:
                 try:
                     if await page.locator(sel).first.is_visible(timeout=1500):
                         await page.locator(sel).first.click()
@@ -76,7 +72,6 @@ async def _etsy_login_with_email_password(email: str, password: str, otp_code: O
                     pass
 
             # Email
-            await page.wait_for_selector("input[name='email'], #join_neu_email_field", timeout=30000)
             await page.fill("input[name='email'], #join_neu_email_field", email)
             await page.locator("button:has-text('Continue'), button[type='submit']").first.click()
 
@@ -137,10 +132,10 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://phantom-foundry-frontend.vercel.app",  # your Vercel frontend
-        "https://phantom-foundry.onrender.com"          # your Render backend
-    ],
-    allow_credentials=True,
+        "https://phantom-foundry-frontend.vercel.app",
+        "https://phantom-foundry.onrender.com"
+],
+allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -208,4 +203,3 @@ async def etsy_drafts(file: UploadFile = File(...)):
             reasons = results[i].get("reasons") or []
             logs.append(f"Compliance fail for {title} -> {', '.join(reasons) if reasons else 'unknown reason'}")
     return {"logs": logs}
-# === END backend/app_main.py ===
