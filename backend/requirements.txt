@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-requests
 python-multipart
+requests
 python-dotenv
 playwright
